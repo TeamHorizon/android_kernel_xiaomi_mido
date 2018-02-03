@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2017 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2018 The Linux Foundation. All rights reserved.
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
  *
@@ -66,6 +66,7 @@
 #include "wlan_hdd_hostapd.h"
 #include "vos_utils.h"
 #include <wlan_hdd_wext.h>
+#include "sapInternal.h"
 
 v_BOOL_t mibIsDot11DesiredBssTypeInfrastructure( hdd_adapter_t *pAdapter );
 
@@ -1510,6 +1511,57 @@ void hdd_print_bss_info(hdd_station_ctx_t *hdd_sta_ctx)
               hdd_sta_ctx->conn_info.noise);
 }
 
+/**
+ * hdd_check_and_move_if_sap_is_on_dfs_chan() - move the sap to non dfs channel
+ * @hdd_ctx: pointer to hdd context
+ * @sta_adapter: pointer to sta adapater
+ *
+ * This function is used to check if SAP is operating on DFS channel in stand
+ * alone mode and move it to non dfs channel
+ *
+ * Return: void.
+ */
+static void hdd_check_and_move_if_sap_is_on_dfs_chan(hdd_context_t *hdd_ctx,
+        hdd_adapter_t *sta_adapter)
+{
+    hdd_adapter_t *sap_adapter;
+    ptSapContext sap_ctx;
+    v_CONTEXT_t vos_ctx;
+    eNVChannelEnabledType chan_state;
+
+    if (hdd_is_sta_sap_scc_allowed_on_dfs_chan(hdd_ctx)) {
+        sap_adapter = hdd_get_adapter(hdd_ctx, WLAN_HDD_SOFTAP);
+
+        if (!sap_adapter) {
+            hddLog(LOG1, FL("SAP not exists, nothing to do"));
+            return;
+        }
+
+        vos_ctx = hdd_ctx->pvosContext;
+        if (!vos_ctx) {
+            hddLog(LOGE, FL("vos_ctx is NULL"));
+            return;
+        }
+        sap_ctx = VOS_GET_SAP_CB(vos_ctx);
+        if (!sap_ctx) {
+            hddLog(LOG1, FL("sap_ctx not exists"));
+            return;
+        }
+
+        chan_state = vos_nv_getChannelEnabledState(sap_ctx->channel);
+
+        hddLog(LOG1, "SAP is operating on channel (%hu), chan_state %d",
+                sap_ctx->channel, chan_state);
+
+        if (vos_nv_getChannelEnabledState(sap_ctx->channel) !=
+                NV_CHANNEL_DFS) {
+            hddLog(LOG1, "SAP is on non DFS channel. nothing to do");
+            return;
+        }
+        hddLog(LOG1, "Schedule workqueue to move the SAP to non DFS channel");
+        schedule_delayed_work(&hdd_ctx->ecsa_chan_change_work, 0);
+    }
+}
 
 static eHalStatus hdd_DisConnectHandler( hdd_adapter_t *pAdapter, tCsrRoamInfo *pRoamInfo,
                                             tANI_U32 roamId, eRoamCmdStatus roamStatus,
@@ -1537,6 +1589,8 @@ static eHalStatus hdd_DisConnectHandler( hdd_adapter_t *pAdapter, tCsrRoamInfo *
     netif_carrier_off(dev);
     //TxTimeoutCount need to reset in case of disconnect handler
     pAdapter->hdd_stats.hddTxRxStats.continuousTxTimeoutCount = 0;
+
+    wlan_hdd_check_and_stop_mon(pAdapter, false);
 
     INIT_COMPLETION(pAdapter->disconnect_comp_var);
     /* If only STA mode is on */
@@ -1814,6 +1868,8 @@ static eHalStatus hdd_DisConnectHandler( hdd_adapter_t *pAdapter, tCsrRoamInfo *
     //Unblock anyone waiting for disconnect to complete
     complete(&pAdapter->disconnect_comp_var);
     hdd_print_bss_info(pHddStaCtx);
+
+    hdd_check_and_move_if_sap_is_on_dfs_chan(pHddCtx, pAdapter);
     return( status );
 }
 
@@ -2114,7 +2170,7 @@ void hdd_PerformRoamSetKeyComplete(hdd_adapter_t *pAdapter)
  */
 static void
 hdd_schedule_ecsa_chan_change_work(hdd_context_t *hdd_ctx,
-                                                  uint8_t sta_session_id)
+                                   uint8_t sta_session_id)
 {
    v_TIME_t conn_start_time;
    int32_t time_diff;
@@ -3930,6 +3986,12 @@ eHalStatus hdd_smeRoamCallback( void *pContext, tCsrRoamInfo *pRoamInfo, tANI_U3
 #endif
             }
            break;
+        case eCSR_ROAM_LOSTLINK_DETECTED:
+             {
+                 if (wlan_hdd_check_and_stop_mon(pAdapter, false))
+                     halStatus = eHAL_STATUS_FAILURE;
+             }
+             break;
         case eCSR_ROAM_LOSTLINK:
         case eCSR_ROAM_DISASSOCIATED:
             {
@@ -4183,6 +4245,46 @@ eHalStatus hdd_smeRoamCallback( void *pContext, tCsrRoamInfo *pRoamInfo, tANI_U3
                                    bss_status);
               else
                   hddLog(LOG1, FL("UPDATE_SCAN_RESULT returned NULL"));
+         }
+       case eCSR_ROAM_STA_CHANNEL_SWITCH:
+         {
+             hdd_adapter_t *pHostapdAdapter = NULL;
+             pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
+             pHddStaCtx = WLAN_HDD_GET_STATION_CTX_PTR(pAdapter);
+
+             if (!pHddCtx || !pHddStaCtx) {
+                 hddLog(LOG1, FL("Invalid pHddCtx or pHddStaCtx"));
+                 break;
+             }
+
+             hddLog(LOG1, FL("eCSR_ROAM_STA_CHANNEL_SWITCH: new channel %hu"),
+                     pRoamInfo->chan_info.chan_id);
+
+             pHddStaCtx->conn_info.operationChannel =
+                 pRoamInfo->chan_info.chan_id;
+
+             pHostapdAdapter = hdd_get_adapter(pHddCtx, WLAN_HDD_SOFTAP);
+             if (pHostapdAdapter &&
+                    (test_bit(SOFTAP_BSS_STARTED,
+                    &pHostapdAdapter->event_flags)))
+             {
+                 /* Restart SAP if its operating channel is different
+                  * from AP channel.
+                  */
+                 hddLog(VOS_TRACE_LEVEL_INFO,"SAP chan %d, STA chan %d, force_scc_with_ecsa %d",
+                         pHostapdAdapter->sessionCtx.ap.operatingChannel,
+                         pRoamInfo->chan_info.chan_id,
+                         pHddCtx->cfg_ini->force_scc_with_ecsa);
+                 if ((pHddCtx->cfg_ini->force_scc_with_ecsa ) &&
+                         (pHostapdAdapter->sessionCtx.ap.operatingChannel !=
+                          pRoamInfo->chan_info.chan_id))
+                 {
+                     schedule_delayed_work(&pHddCtx->ecsa_chan_change_work, 0);
+                 }
+                 else
+                     hddLog(LOG1, FL("SAP restart not required"));
+             } else
+                 hddLog(LOG1, FL("SAP not active, nothing to do"));
          }
          break;
        default:
@@ -4758,6 +4860,9 @@ int __iw_set_essid(struct net_device *dev,
     if( SIR_MAC_MAX_SSID_LENGTH < wrqu->essid.length )
         return -EINVAL;
     pRoamProfile = &pWextState->roamProfile;
+
+    if (wlan_hdd_check_and_stop_mon(pAdapter, true))
+        return -EINVAL;
 
     /*Try disconnecting if already in connected state*/
     status = wlan_hdd_try_disconnect(pAdapter);
