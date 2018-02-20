@@ -377,12 +377,36 @@ CHECKFLAGS     := -D__linux__ -Dlinux -D__STDC__ -Dunix -D__unix__ \
 		  -Wbitwise -Wno-return-void $(CF)
 CFLAGS_MODULE   =
 AFLAGS_MODULE   =
-LDFLAGS_MODULE  =
+LDFLAGS_MODULE  = --strip-debug
 CFLAGS_KERNEL	=
 AFLAGS_KERNEL	=
 CFLAGS_GCOV	= -fprofile-arcs -ftest-coverage -fno-tree-loop-im
 CFLAGS_KCOV	= -fsanitize-coverage=trace-pc
 
+#
+# Clang opt flags
+#
+ifeq ($(COMPILER),clang)
+POLLY_FLAGS := -mllvm -polly \
+		-mllvm -polly-run-dce \
+		-mllvm -polly-run-inliner \
+		-mllvm -polly-opt-fusion=max \
+		-mllvm -polly-ast-use-context \
+		-mllvm -polly-detect-keep-going \
+		-mllvm -polly-vectorizer=stripmine \
+
+ARM_OPT_FLAGS := -mcpu=kryo \
+		-mhvx-double -mhvx -marm \
+
+OPT_FLAGS := -O3 -pipe -fvectorize \
+		-fslp-vectorize -freroll-loops -funroll-loops \
+		$(POLLY_FLAGS) $(ARM_OPT_FLAGS)
+else
+#
+# GCC opt flags
+#
+KBUILD_CFLAGS += -O2 -pipe -mcpu=cortex-a53+crc+crypto
+endif
 
 ifeq ($(cc-name),clang)
 ifneq ($(CROSS_COMPILE),)
@@ -396,7 +420,7 @@ endif
 ifneq ($(CLANG_ENABLE_IA),1)
 CLANG_IA_FLAG	= -no-integrated-as
 endif
-CLANG_FLAGS	:= $(CLANG_TARGET) $(CLANG_GCC_TC) $(CLANG_IA_FLAG) -meabi gnu
+CLANG_FLAGS	:= $(CLANG_TARGET) $(CLANG_GCC_TC) $(CLANG_IA_FLAG) -meabi gnu $(OPT_FLAGS)
 endif
 
 # Use USERINCLUDE when you must reference the UAPI directories only.
