@@ -448,6 +448,21 @@ static const struct attribute_group attribute_group = {
 	.attrs = attributes,
 };
 
+static void set_fingerprintd_nice(int nice)
+{
+	struct task_struct *p;
+
+	read_lock(&tasklist_lock);
+	for_each_process(p) {
+		if (!memcmp(p->comm, "fingerprint@2.0", 16)) {
+			pr_info("fingerprint nice set to:%i", nice);
+			set_user_nice(p, nice);
+			break;
+		}
+	}
+	read_unlock(&tasklist_lock);
+}
+
 static irqreturn_t fpc1020_irq_handler(int irq, void *handle)
 {
 	struct fpc1020_data *fpc1020 = handle;
@@ -570,7 +585,7 @@ static int fpc1020_remove(struct platform_device *pdev)
 static int fpc1020_suspend(struct device *dev)
 {
 	struct fpc1020_data *fpc1020 = dev_get_drvdata(dev);
-
+	set_fingerprintd_nice(MIN_NICE);
 	fpc1020->clocks_suspended = fpc1020->clocks_enabled;
 	set_clks(fpc1020, false);
 	return 0;
@@ -579,7 +594,7 @@ static int fpc1020_suspend(struct device *dev)
 static int fpc1020_resume(struct device *dev)
 {
 	struct fpc1020_data *fpc1020 = dev_get_drvdata(dev);
-
+	set_fingerprintd_nice(0);
 	if (fpc1020->clocks_suspended)
 		set_clks(fpc1020, true);
 
